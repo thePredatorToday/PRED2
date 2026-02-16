@@ -1,0 +1,12 @@
+### Nasazení & Debug
+- **Aktualizace docs**: Kopíruj obsah výše do PREDATOR/docs/THE_PREDATOR_master_spec_v1.2.md (přejmenuj starý na v1.1 pro historii).
+- **Spuštění MkDocs**: `mkdocs serve` – otevři http://127.0.0.1:8000, ověř renderování: Code blocks by měly mít syntax highlighting, diagramy preformatted, tabulky zarovnané; žádné left-aligned text mimo.
+- **Debug formátování**: V ZED/VS Code: Otevři md soubor, preview (Ctrl+Shift+V v VS Code) – ověř, že ```python bloky jsou indented a colored; pokud ne, přidej extra newline před/za backticks.
+- **Docker pro docs**: Přidej do Dockerfile `RUN pip install mkdocs`, pak `docker run -p 8000:8000 predator mkdocs serve -a 0.0.0.0:8000` – check v browseru pro consistency.
+- **Ověření funkčnosti**: Spusť `main.py`, ověř logy (strukturované JSON); copy-paste code z spec do temp.py, spusť `python temp.py` – žádné syntax errors (Pydantic validace projde).
+
+### Další mety
+- Implementuj Phase 1: Rozšiř miner.py o parsing pairs do TokenSnapshot (emit real events); přidej hunter.py logiku (velocity score calculation) – testuj v Shadow mode s 1h runem, analyzuj logs pro detected momentum.
+- Přidej CI/CD check: V .github/workflows/ci.yml přidej step `mkdocs build` pro validaci docs renderování bez errors.
+- Nastav observability: Integruj Sentry do logging.py pro error tracking; spusť v Beta s malým kapitálem, monitoruj desync v health checku.
+- Posuň do ostrého: Deploy na VPS (Docker Compose), přidej Prometheus/Grafana pro metriky (latency, trades/sec), automatický restart při crashi.

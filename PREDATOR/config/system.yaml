@@ -1,0 +1,21 @@
+system:
+  mode: SHADOW # PAPER/SHADOW/BETA/LIVE
+  max_position_size_sol: 2
+  max_open_positions: 3
+  daily_drawdown_pct: -30
+  solana_reserve: 0.005
+  api_retry_attempts: 3
+  api_backoff_sec: 5
+
+analyzer_weights:
+  liquidity_stability: 0.20
+  holder_distribution: 0.20
+  lp_lock: 0.15
+  mint_freeze: 0.15
+  volume_growth: 0.20
+  volatility: 0.10
+
+apis:
+  dexscreener: "https://api.dexscreener.com/latest/dex/pairs/solana"
+  jupiter: "https://quote-api.jup.ag/v6/quote"
+  solana_rpc: "${SOLANA_RPC_URL}" # Env var substitution
