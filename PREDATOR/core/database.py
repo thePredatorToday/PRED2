@@ -3,7 +3,7 @@ core/database.py – SQLite databázová vrstva pro PREDATOR.
 
 Synchronní wrapper nad sqlite3 s thread-safe přístupem.
 Tabulky: signals, trades, predictions, commands, module_reports,
-         coin_updates, learner_suggestions, system_state.
+         coin_updates, learner_suggestions, system_state, event_log.
 """
 
 import logging
@@ -133,7 +133,20 @@ class Database:
                 )
             """)
 
-            # Indexy pro rychlé dotazy
+            # Event log pro dashboard - bohaté logy systému
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS event_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    module TEXT NOT NULL,
+                    level TEXT NOT NULL DEFAULT 'INFO',
+                    event_type TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Indexy
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_signals_mint ON signals(mint)"
             )
@@ -143,12 +156,72 @@ class Database:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_commands_processed ON commands(processed)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_event_log_created ON event_log(created_at)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_event_log_module ON event_log(module)"
+            )
 
             conn.commit()
             logger.info("Databaze uspesne inicializovana.")
         except Exception as e:
             logger.critical(f"Chyba pri inicializaci databaze: {e}")
             raise
+
+    # --- Event Log ---
+
+    def log_event(
+        self,
+        module: str,
+        event_type: str,
+        message: str,
+        level: str = "INFO",
+        details: Optional[str] = None,
+    ) -> None:
+        """Zapíše událost do event_log tabulky pro dashboard."""
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "INSERT INTO event_log (module, level, event_type, message, details) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (module, level, event_type, message, details),
+            )
+            conn.commit()
+        except Exception:
+            pass  # Nesmí blokovat hlavní logiku
+
+    def fetch_event_log(self, limit: int = 200, module: Optional[str] = None) -> List[Tuple]:
+        """Vrátí poslední události z event_log."""
+        try:
+            conn = self._get_connection()
+            if module:
+                cursor = conn.execute(
+                    "SELECT id, module, level, event_type, message, details, created_at "
+                    "FROM event_log WHERE module=? ORDER BY id DESC LIMIT ?",
+                    (module, limit),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id, module, level, event_type, message, details, created_at "
+                    "FROM event_log ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                )
+            return cursor.fetchall()
+        except Exception:
+            return []
+
+    def cleanup_old_events(self, keep_hours: int = 24) -> None:
+        """Smaže staré event_log záznamy."""
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "DELETE FROM event_log WHERE created_at < datetime('now', ?)",
+                (f"-{keep_hours} hours",),
+            )
+            conn.commit()
+        except Exception:
+            pass
 
     # --- Signals ---
 
@@ -327,8 +400,7 @@ class Database:
                 (limit,),
             )
             return cursor.fetchall()
-        except Exception as e:
-            logger.error(f"Chyba pri cteni coin updates: {e}")
+        except Exception:
             return []
 
     # --- Learner Suggestions ---
@@ -355,8 +427,7 @@ class Database:
                 (limit,),
             )
             return cursor.fetchall()
-        except Exception as e:
-            logger.error(f"Chyba pri cteni learner suggestions: {e}")
+        except Exception:
             return []
 
 

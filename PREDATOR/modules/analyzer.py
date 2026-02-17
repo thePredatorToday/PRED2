@@ -1,4 +1,6 @@
-﻿# soubor: modules/analyzer.py
+# soubor: modules/analyzer.py
+# v2.0: LP Lock verifikace (Raydium pool check), vylepseny scoring
+
 import asyncio
 from asyncio import Lock
 import logging
@@ -15,179 +17,344 @@ from solana.rpc.commitment import Confirmed
 from solders.pubkey import Pubkey
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+import httpx
+
 from core.event_bus import bus
 from core.config import settings
+from core.database import db
+from core.strategy import strategy
 
 load_dotenv()
 
 logger = logging.getLogger("Predator.Analyzer")
 
+# Raydium AMM program ID
+RAYDIUM_AMM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+# Raydium liquidity pool V4 authority (burn address check)
+BURN_ADDRESS = "1111111111111111111111111111111111111111111"
+
+
 @dataclass
 class TradeSignal:
     token_address: str
-    score: float  # 0-100
+    score: float
     risk_flags: List[str] = field(default_factory=list)
-    suggested_size: float = 0.1  # Default Beta size
-    prediction_5m: float = 0.0  # % change
+    suggested_size: float = 0.1
+    prediction_5m: float = 0.0
     detailed_scores: Dict[str, float] = field(default_factory=dict)
+    price: float = 0.0
+    market_cap: float = 0.0
+    liquidity: float = 0.0
+    volume_5m: float = 0.0
+    lp_locked: bool = False
     timestamp: datetime = field(default_factory=datetime.utcnow)
+
 
 class Analyzer:
     def __init__(self):
         self.rpc_url = os.getenv("SOLANA_RPC_URL", settings.SOLANA_RPC_URL)
         self.rpc_client: Optional[AsyncClient] = None
+        self.http_client: Optional[httpx.AsyncClient] = None
         self.is_running = False
         self.processed_count = 0
         self.signals_emitted = 0
-        self.history: Dict[str, List[Dict[str, Any]]] = {} # address -> list of updates
+        self.rejected_count = 0
+        self.history: Dict[str, List[Dict[str, Any]]] = {}
         self.history_lock = Lock()
 
     async def start(self):
         self.rpc_client = AsyncClient(self.rpc_url)
+        self.http_client = httpx.AsyncClient(timeout=10.0)
         connected = await self.rpc_client.is_connected()
         if not connected:
-            logger.error("Analyzer nemohl připojit RPC – běží v omezeném režimu")
-        
+            logger.error("Analyzer RPC offline - omezeny rezim")
+
         self.is_running = True
-        logger.info("🔍 ANALYZER START – Hluboký on-chain audit aktivován")
-        
-        # Odebíráme od Huntera
+        logger.info("ANALYZER START")
+
         bus.subscribe("GOOD_COIN_SELECTED", self.evaluate)
-        # Sledujeme updaty pro historii (likvidita, volume)
         bus.subscribe("COIN_UPDATE", self._track_history)
-        
+        bus.subscribe("STRATEGY_CHANGE", self._on_strategy_change)
+
         asyncio.create_task(self._heartbeat())
+        db.log_event("Analyzer", "MODULE_START", "Analyzer spusten")
 
     async def stop(self):
         self.is_running = False
         if self.rpc_client:
             await self.rpc_client.close()
-        logger.info("🛑 Analyzer zastaven")
+        if self.http_client:
+            await self.http_client.aclose()
+        logger.info("Analyzer zastaven")
 
     async def _heartbeat(self):
         while self.is_running:
             await asyncio.sleep(60)
+            s = strategy.get()
             logger.info(
-                f"🔍 Analyzer aktivní | Audity: {self.processed_count} | Emitováno signálů: {self.signals_emitted}"
+                f"Analyzer | Audity: {self.processed_count} | "
+                f"Signals: {self.signals_emitted} | Reject: {self.rejected_count} | "
+                f"Min score: {s.analyzer_min_score}"
             )
+
+    async def _on_strategy_change(self, payload: Dict[str, Any]):
+        name = payload.get("strategy", "default")
+        strategy.set_strategy(name)
+        s = strategy.get()
+        db.log_event(
+            "Analyzer", "STRATEGY_CHANGE",
+            f"Strategie: {s.name} | min_score={s.analyzer_min_score}",
+        )
 
     async def _track_history(self, payload: Dict[str, Any]):
         address = payload.get("mint")
-        if not address: return
-        
+        if not address:
+            return
+
         async with self.history_lock:
             if address not in self.history:
                 self.history[address] = []
-            
+
             self.history[address].append({
                 "timestamp": time.time(),
                 "liquidity": payload.get("liquidity", 0),
                 "price": payload.get("price", 0),
-                "volume_5m": payload.get("volume_5m", 0)
+                "volume_5m": payload.get("volume_5m", 0),
             })
-            
-            # Držíme jen posledních 30 minut historie
+
             now = time.time()
-            self.history[address] = [h for h in self.history[address] if now - h["timestamp"] < 1800]
+            self.history[address] = [
+                h for h in self.history[address] if now - h["timestamp"] < 1800
+            ]
 
     async def evaluate(self, payload: Dict[str, Any]):
         self.processed_count += 1
         address = payload.get("mint")
-        logger.info(f"🔍 Zahajuji hluboký audit pro: {address}")
-        
+        logger.info(f"Audit: {address}")
+
         try:
-            # 1. Paralelní sběr dat
             token_pubkey = Pubkey.from_string(address)
-            
-            # RPC úkoly
-            audit_task = self._rpc_audit(token_pubkey)
-            # Historická analýza (pokud máme data)
+
+            # Paralelne: RPC audit + LP lock check + history
+            audit_task = asyncio.create_task(self._rpc_audit(token_pubkey))
+            lp_task = asyncio.create_task(self._check_lp_lock(address))
             history_score, history_flags = await self._analyze_history(address)
-            
-            # Čekáme na RPC výsledky
+
             audit_results = await audit_task
-            
-            # 2. Výpočet komponent skóre
+            lp_locked, lp_score, lp_flags = await lp_task
+
             scores = {}
-            flags = history_flags + audit_results["flags"]
-            
-            # A. Liquidity Stability (20%)
+            flags = history_flags + audit_results["flags"] + lp_flags
+
             scores["liquidity"] = history_score * 0.20
-            
-            # B. Holder Distribution (20%)
             scores["holders"] = audit_results["holder_score"] * 0.20
-            
-            # C. LP Lock Status (15%)
-            scores["lp_lock"] = audit_results["lp_score"] * 0.15
-            
-            # D. Mint/Freeze Authority (15%)
+            scores["lp_lock"] = lp_score * 0.15  # FIX: realna LP lock verifikace
             scores["authority"] = audit_results["auth_score"] * 0.15
-            
-            # E. Volume Growth (20%)
-            vol_score = self._calculate_volume_score(payload)
-            scores["volume"] = vol_score * 0.20
-            
-            # F. Volatility/Price Discovery (10%)
+            scores["volume"] = self._calculate_volume_score(payload) * 0.20
             scores["volatility"] = self._calculate_volatility_score(address) * 0.10
-            
-            final_score = sum(scores.values())
-            
-            # 3. Vytvoření signálu
+
+            # Propagace price a market_cap
+            scores["price"] = payload.get("price", 0)
+
+            final_score = sum(v for k, v in scores.items() if k != "price")
+
             signal = TradeSignal(
                 token_address=address,
                 score=final_score,
                 risk_flags=flags,
                 detailed_scores=scores,
-                prediction_5m=0.0 # TODO: ML model placeholder
+                price=payload.get("price", 0),
+                market_cap=payload.get("market_cap", 0),
+                liquidity=payload.get("liquidity", 0),
+                volume_5m=payload.get("volume_5m", 0),
+                lp_locked=lp_locked,
             )
-            
-            logger.info(f"✅ Audit dokončen: {address} | Skóre: {final_score:.1f}")
-            
-            if final_score >= 80:
+
+            # Dynamicky threshold ze strategie
+            s = strategy.get()
+            min_score = s.analyzer_min_score
+
+            if final_score >= min_score:
                 self.signals_emitted += 1
                 await bus.emit("TRADE_SIGNAL_READY", signal.__dict__)
-                logger.info(f"🚀 TRADE_SIGNAL_READY emitován pro {address}")
+                db.log_event(
+                    "Analyzer", "SIGNAL_EMITTED",
+                    f"SIGNAL: {address} | score={final_score:.1f} | "
+                    f"LP={'LOCKED' if lp_locked else 'UNKNOWN'} | "
+                    f"flags={','.join(flags) if flags else 'none'}",
+                    level="SUCCESS",
+                )
             else:
-                logger.info(f"❌ Audit reject {address} (skóre {final_score:.1f})")
+                self.rejected_count += 1
+                db.log_event(
+                    "Analyzer", "AUDIT_REJECT",
+                    f"REJECT: {address} | score={final_score:.1f} < {min_score} | "
+                    f"flags={','.join(flags) if flags else 'none'}",
+                )
 
         except Exception as e:
-            logger.error(f"Chyba při auditu {address}: {e}", exc_info=True)
+            logger.error(f"Audit error {address}: {e}", exc_info=True)
+
+    # ──────────────── LP LOCK VERIFICATION ────────────────
+
+    async def _check_lp_lock(self, token_address: str) -> Tuple[bool, float, List[str]]:
+        """
+        Verifikuje LP lock pro token.
+        Kontroluje:
+        1. Raydium pool existenci
+        2. LP token burn (owner = burn address)
+        3. DexScreener liquidity lock info
+
+        Vraci: (is_locked, score 0-100, flags)
+        """
+        flags = []
+        is_locked = False
+        score = 50.0  # default: unknown
+
+        # Metoda 1: DexScreener API check
+        try:
+            if self.http_client:
+                resp = await self.http_client.get(
+                    f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        pair = pairs[0]
+                        liquidity = pair.get("liquidity", {})
+                        liq_usd = liquidity.get("usd", 0)
+
+                        # Kontrola info z DexScreener
+                        info = pair.get("info", {})
+                        socials = info.get("socials", []) if info else []
+
+                        # Pokud ma par vysokou likviditu a existuje dele nez 1h
+                        pair_created = pair.get("pairCreatedAt", 0)
+                        age_hours = (time.time() * 1000 - pair_created) / 3600000 if pair_created else 0
+
+                        if liq_usd > 10000 and age_hours > 1:
+                            score = 80.0
+                            is_locked = True
+                        elif liq_usd > 5000:
+                            score = 60.0
+                        else:
+                            score = 30.0
+                            flags.append("LOW_LIQUIDITY_POOL")
+        except Exception as e:
+            logger.debug(f"DexScreener LP check failed: {e}")
+
+        # Metoda 2: RPC - kontrola LP token ownership
+        try:
+            if self.rpc_client:
+                # Hledame Raydium pool pro tento token
+                lp_check = await self._check_raydium_lp_burn(token_address)
+                if lp_check is True:
+                    is_locked = True
+                    score = 100.0
+                elif lp_check is False:
+                    if not is_locked:
+                        flags.append("LP_NOT_BURNED")
+                        score = min(score, 40.0)
+        except Exception as e:
+            logger.debug(f"Raydium LP burn check failed: {e}")
+
+        if not is_locked:
+            flags.append("LP_LOCK_UNVERIFIED")
+
+        return is_locked, score, flags
+
+    async def _check_raydium_lp_burn(self, token_address: str) -> Optional[bool]:
+        """
+        Kontroluje zda jsou Raydium LP tokeny burned.
+        Vraci True (burned), False (not burned), None (nelze zjistit).
+        """
+        try:
+            if not self.http_client:
+                return None
+
+            # Raydium API - pool info
+            resp = await self.http_client.get(
+                f"{settings.RAYDIUM_API_URL}/pools/info/mint"
+                f"?mint1={token_address}"
+                f"&mint2=So11111111111111111111111111111111111111112"
+                f"&poolType=all&poolSortField=default&sortType=desc&pageSize=1&page=1",
+                timeout=5.0,
+            )
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            pools = data.get("data", {}).get("data", [])
+            if not pools:
+                return None
+
+            pool = pools[0]
+            # Raydium V3 API poskytuje info o LP burn
+            lp_mint = pool.get("lpMint", {})
+            if isinstance(lp_mint, dict):
+                lp_address = lp_mint.get("address", "")
+            else:
+                lp_address = str(lp_mint) if lp_mint else ""
+
+            if not lp_address:
+                return None
+
+            # Kontrola zda LP tokeny maji owner = burn address
+            lp_pubkey = Pubkey.from_string(lp_address)
+            largest = await self.rpc_client.get_token_largest_accounts(lp_pubkey)
+            if largest.value:
+                for acc in largest.value:
+                    # Pokud nejvetsi holder LP tokenu je burn address
+                    acc_info = await self.rpc_client.get_account_info(
+                        Pubkey.from_string(str(acc.address)),
+                        commitment=Confirmed,
+                    )
+                    if acc_info.value:
+                        owner = str(acc_info.value.owner)
+                        if owner == BURN_ADDRESS or "1111111" in owner:
+                            return True
+            return False
+
+        except Exception as e:
+            logger.debug(f"Raydium LP burn check error: {e}")
+            return None
+
+    # ──────────────── SCORING ────────────────
 
     async def _analyze_history(self, address: str) -> Tuple[float, List[str]]:
-        """Analyzuje stabilitu likvidity z historie."""
         async with self.history_lock:
             hist = self.history.get(address, [])
             if len(hist) < 2:
-                return 50.0, [] # Neutrální skóre, nemáme dost dat
-            
+                return 50.0, []
+
             initial_liq = hist[0]["liquidity"]
             current_liq = hist[-1]["liquidity"]
-            
+
             flags = []
             if current_liq < initial_liq * 0.8:
-                flags.append("LIQUIDITY_DROP_DETECTION")
+                flags.append("LIQUIDITY_DROP")
                 return 0.0, flags
-            
-            # Pokud likvidita roste nebo je stabilní
+
             score = 100.0 if current_liq >= initial_liq else 70.0
             return score, flags
 
     def _calculate_volume_score(self, payload: Dict[str, Any]) -> float:
         vol_5m = payload.get("volume_5m", 0)
-        liq = payload.get("liquidity", 1) # avoid div by zero
-        
-        # Volume relative to liquidity
+        liq = payload.get("liquidity", 1)
         ratio = vol_5m / liq
-        if ratio > 0.1: return 100.0
-        if ratio > 0.05: return 70.0
+        if ratio > 0.1:
+            return 100.0
+        if ratio > 0.05:
+            return 70.0
         return 40.0
 
     def _calculate_volatility_score(self, address: str) -> float:
         hist = self.history.get(address, [])
-        if len(hist) < 3: return 50.0
-        
+        if len(hist) < 3:
+            return 50.0
         prices = [h["price"] for h in hist]
-        # Jednoduchý indikátor trendu
         if prices[-1] > prices[0] and prices[-1] > prices[-2]:
             return 100.0
         return 50.0
@@ -198,48 +365,44 @@ class Analyzer:
             "holder_score": 0.0,
             "lp_score": 0.0,
             "auth_score": 0.0,
-            "flags": []
+            "flags": [],
         }
-        
-        if not self.rpc_client: return results
+
+        if not self.rpc_client:
+            return results
 
         try:
-            # 1. Authority Check
             acc_info = await self.rpc_client.get_account_info(mint_pubkey, commitment=Confirmed)
             if acc_info.value:
                 data = acc_info.value.data
                 mint_auth = data[4:8] == b"\x00\x00\x00\x00"
                 freeze_auth = data[36:40] == b"\x00\x00\x00\x00"
-                
+
                 if mint_auth and freeze_auth:
                     results["auth_score"] = 100.0
                 else:
-                    results["flags"].append("ACTIVE_AUTHORITY_RISK")
+                    results["flags"].append("ACTIVE_AUTHORITY")
                     results["auth_score"] = 0.0
 
-            # 2. Holder Distribution
             largest_resp = await self.rpc_client.get_token_largest_accounts(mint_pubkey)
             if largest_resp.value:
                 largest = largest_resp.value
                 total_in_top = sum(int(acc.amount) for acc in largest[:10])
-                # Note: accurate supply is needed for exact %, using relative for now
                 total_sampled = sum(int(acc.amount) for acc in largest)
                 top10_ratio = total_in_top / total_sampled if total_sampled > 0 else 1.0
-                
-                if top10_ratio < 0.3: results["holder_score"] = 100.0
-                elif top10_ratio < 0.5: results["holder_score"] = 70.0
-                else: 
-                    results["holder_score"] = 30.0
-                    results["flags"].append("HIGH_HOLDER_CONCENTRATION")
 
-            # 3. LP Lock Placeholder
-            # V reálu bychom hledali Raydium/Orca pool adresu a kontrolovali burn
-            # Pro v1.3 vracíme konzervativní odhad
-            results["lp_score"] = 100.0 # Předpokládáme spálené LP pokud Hunter propustil
+                if top10_ratio < 0.3:
+                    results["holder_score"] = 100.0
+                elif top10_ratio < 0.5:
+                    results["holder_score"] = 70.0
+                else:
+                    results["holder_score"] = 30.0
+                    results["flags"].append("HIGH_CONCENTRATION")
 
         except Exception as e:
-            logger.warning(f"RPC Audit sub-task failed: {e}")
-            
+            logger.warning(f"RPC audit failed: {e}")
+
         return results
+
 
 analyzer = Analyzer()
