@@ -40,12 +40,19 @@ class Miner:
         self.priority_queue: Dict[str, Dict[str, Any]] = defaultdict(
             lambda: {"priority": "LOW", "last_scan": 0.0, "data": None}
         )
-        self.dedup_set = set()
+        # M1: Dedup s TTL (dict hash -> timestamp) místo neomezeného setu
+        self.dedup_set: Dict[str, float] = {}
+        self.dedup_ttl = 3600  # 1 hodina TTL
         self.rate_limit_backoff = 5
         self.http_client = httpx.AsyncClient(timeout=10.0)
         self.dex_semaphore = asyncio.Semaphore(5)
         self.mint_counter_last_heartbeat = 0
         self.emit_counter_last_heartbeat = 0
+        # B1: Atributy pro _rotate_rpc (chyběly → AttributeError)
+        self.rpc_endpoints = [
+            "https://api.mainnet-beta.solana.com",
+        ]
+        self.current_rpc_idx = 0
 
     async def start(self):
         self.is_running = True
@@ -69,12 +76,16 @@ class Miner:
             new_mints = self.mint_counter_last_heartbeat
             emitted = self.emit_counter_last_heartbeat
             q_size = len(self.priority_queue)
+            dedup_size = len(self.dedup_set)
             logger.info(
-                f"🚀 Miner aktivní | Nové minty za min: {new_mints} | "
-                f"Emitováno eventů: {emitted} | Queue: {q_size}"
+                f"Miner aktivni | Nove minty/min: {new_mints} | "
+                f"Emitovano: {emitted} | Queue: {q_size} | Dedup: {dedup_size}"
             )
+            # M4: Reset countery PRED logem (uz je spravne)
             self.mint_counter_last_heartbeat = 0
             self.emit_counter_last_heartbeat = 0
+            # M1: Periodicky cistit dedup set
+            self._cleanup_dedup()
 
     async def pump_fun_ws_listener(self):
         while self.is_running:
@@ -99,9 +110,9 @@ class Miner:
                             if self._is_dupe(mint):
                                 continue
 
-                            self.dedup_set.add(
-                                hashlib.sha256(mint.encode()).hexdigest()
-                            )
+                            # M1: TTL-based dedup
+                            h = hashlib.sha256(mint.encode()).hexdigest()
+                            self.dedup_set[h] = time.time()
                             self.mint_counter_last_heartbeat += 1
 
                             logger.debug(
@@ -252,7 +263,17 @@ class Miner:
         logger.debug(f"Rotace RPC → {self.rpc_endpoints[self.current_rpc_idx]}")
 
     def _is_dupe(self, mint: str) -> bool:
-        return hashlib.sha256(mint.encode()).hexdigest() in self.dedup_set
+        h = hashlib.sha256(mint.encode()).hexdigest()
+        if h in self.dedup_set:
+            return True
+        return False
+
+    def _cleanup_dedup(self):
+        """M1: Periodický cleanup starých dedup záznamů."""
+        now = time.time()
+        expired = [k for k, ts in self.dedup_set.items() if now - ts > self.dedup_ttl]
+        for k in expired:
+            del self.dedup_set[k]
 
 
 if __name__ == "__main__":

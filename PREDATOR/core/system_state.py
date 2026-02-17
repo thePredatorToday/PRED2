@@ -1,9 +1,22 @@
+"""
+core/system_state.py – Globální stav systému.
+
+Opravy:
+- B5: Výchozí balance_sol z VIRTUAL_BALANCE_SOL pro SHADOW/PAPER mód
+- Opravený save() – sqlite3.Connection není context manager pro commit
+- Bezpečnější load() s fallbackem
+"""
+
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Optional
 
 from core.database import db
+from core.config import settings
+
+logger = logging.getLogger("Predator.SystemState")
 
 
 @dataclass
@@ -19,36 +32,49 @@ class SystemState:
     error_state: Optional[str] = None
 
     def save(self):
+        """Uloží stav do DB."""
         self.last_update = datetime.utcnow()
-        with db.connect() as conn:
-            cursor = conn.cursor()
+        try:
+            conn = db.connect()
             data_dict = asdict(self)
-            # Serialize datetimes to ISO format for JSON
-            if isinstance(data_dict.get("session_start"), datetime):
-                data_dict["session_start"] = data_dict["session_start"].isoformat()
-            if isinstance(data_dict.get("last_update"), datetime):
-                data_dict["last_update"] = data_dict["last_update"].isoformat()
+            for key in ("session_start", "last_update"):
+                if isinstance(data_dict.get(key), datetime):
+                    data_dict[key] = data_dict[key].isoformat()
             data = json.dumps(data_dict)
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO system_state (key, value) VALUES ('current', ?)
-                """,
+            conn.execute(
+                "INSERT OR REPLACE INTO system_state (key, value) VALUES ('current', ?)",
                 (data,),
             )
             conn.commit()
+        except Exception as e:
+            logger.error(f"Chyba pri ukladani stavu: {e}")
 
     @classmethod
     def load(cls) -> "SystemState":
-        with db.connect() as conn:
+        """Načte stav z DB nebo vytvoří výchozí."""
+        try:
+            conn = db.connect()
             cursor = conn.cursor()
             cursor.execute("SELECT value FROM system_state WHERE key = 'current'")
             row = cursor.fetchone()
             if row:
                 data = json.loads(row[0])
-                data["session_start"] = datetime.fromisoformat(data["session_start"])
-                data["last_update"] = datetime.fromisoformat(data["last_update"])
+                for key in ("session_start", "last_update"):
+                    if key in data and isinstance(data[key], str):
+                        data[key] = datetime.fromisoformat(data[key])
                 return cls(**data)
-            return cls(mode="SHADOW", status="PAUSED", balance_sol=0.0)
+        except Exception as e:
+            logger.warning(f"Nelze nacist stav z DB, vytvarim vychozi: {e}")
+
+        # B5: Výchozí stav - virtuální balance pro SHADOW/PAPER mód
+        mode = settings.SYSTEM_MODE
+        balance = settings.VIRTUAL_BALANCE_SOL if mode in ("SHADOW", "PAPER") else 0.0
+        return cls(
+            mode=mode,
+            status="RUNNING",
+            balance_sol=balance,
+            solana_reserve=settings.SOLANA_RESERVE,
+        )
 
 
 state = SystemState.load()

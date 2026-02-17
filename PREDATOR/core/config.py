@@ -1,3 +1,10 @@
+"""
+core/config.py – Systémová konfigurace (Pydantic Settings).
+
+Rozšíření: přidáno VIRTUAL_BALANCE, X_API_KEY/SECRET, X_ACCESS_TOKEN/SECRET
+pro OAuth 1.0a, slippage settings.
+"""
+
 import os
 from typing import Optional
 
@@ -32,6 +39,9 @@ class Settings(BaseSettings):
     DAILY_DRAWDOWN_PCT: float = -30.0
     SOLANA_RESERVE: float = 0.005
 
+    # Virtual balance for SHADOW/PAPER mode (SOL)
+    VIRTUAL_BALANCE_SOL: float = 10.0
+
     # Scanner
     SCAN_INTERVAL_MIN: int = 45
     SCAN_INTERVAL_MAX: int = 60
@@ -41,16 +51,30 @@ class Settings(BaseSettings):
     HUNTER_MIN_LIQUIDITY: float = 2000.0
     HUNTER_MIN_VOLUME: float = 1000.0
 
+    # Slippage
+    SLIPPAGE_MAX_BPS: int = 500  # 5% max slippage
+    PRIORITY_FEE_LAMPORTS: int = 10000
+
     # Logging
     LOG_LEVEL: str = "INFO"
 
-    # Notifications
+    # Notifications - Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
+
+    # Notifications - X (Twitter) OAuth 1.0a (4 tokeny)
+    X_API_KEY: Optional[str] = None
+    X_API_SECRET: Optional[str] = None
+    X_ACCESS_TOKEN: Optional[str] = None
+    X_ACCESS_TOKEN_SECRET: Optional[str] = None
+    # Legacy bearer (pro čtení, ne pro POST)
     X_BEARER_TOKEN: Optional[str] = None
 
     # Notifier
     NOTIFIER_FOLLOWUP_SEC: int = 1800
+
+    # Wallet
+    WALLET_PRIVATE_KEY: Optional[str] = None
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
