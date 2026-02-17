@@ -1,10 +1,6 @@
 # soubor: main.py
-# Hlavní vstupní bod PREDATOR systému – spouští Miner + Hunter + event bus pipeline
-#
-# Opravy:
-# - B2: Odstraněn duplicitní bus.subscribe("NEW_COIN_FOUND", hunter.evaluate)
-#        Hunter si subscribe řeší sám v hunter.start()
-# - S3: Signal handling (SIGTERM/SIGINT) pro graceful shutdown
+# Hlavni vstupni bod PREDATOR systemu
+# v2.0: Health check, vylepseny module management
 
 import asyncio
 import json
@@ -24,28 +20,32 @@ from modules.risk_guard import risk_guard
 from modules.executor import executor
 from modules.learner import learner
 from modules.notifier import notifier
+from modules.health_check import health_check
 
 logger = logging.getLogger("Predator.Main")
 
-# S3: Global shutdown event
 _shutdown_event = asyncio.Event()
 
 
 async def main():
     setup_logging(level_console="INFO", level_file="DEBUG")
     logger.info("=" * 70)
-    logger.info("THE PREDATOR – Trading Bot Solana | v1.3-fixed")
+    logger.info("THE PREDATOR – Trading Bot Solana | v2.0-autonomous")
     logger.info(f"Mod: {state.mode} | Stav: {state.status}")
     logger.info(f"Balanc: {state.balance_sol:.4f} SOL")
+    logger.info(f"Strategie: {strategy.get().name}")
+    s = strategy.get()
+    logger.info(
+        f"MoonBag: {'ON' if s.moon_bag_enabled else 'OFF'} | "
+        f"DCA: {'ON' if s.dca_enabled else 'OFF'} | "
+        f"Cooldown: {s.cooldown_seconds}s | "
+        f"TX Sim: {'ON' if s.use_tx_simulation else 'OFF'}"
+    )
     logger.info("=" * 70)
 
     miner = Miner()
     hunter = Hunter()
 
-    # B2: ODSTRANĚNO – Hunter si subscribe řeší sám v start()
-    # bus.subscribe("NEW_COIN_FOUND", hunter.evaluate)  # DUPLIKÁT
-
-    # S3: Signal handling
     loop = asyncio.get_running_loop()
 
     def _signal_handler():
@@ -56,7 +56,6 @@ async def main():
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            # Windows nemá add_signal_handler
             pass
 
     try:
@@ -70,6 +69,7 @@ async def main():
             "risk_guard": risk_guard,
             "executor": executor,
             "learner": learner,
+            "health_check": health_check,
         }
 
         module_tasks = {}
@@ -164,6 +164,9 @@ async def main():
                                     stop_module_sync(m)
                                 state.status = "PAUSED"
                                 state.save()
+                            elif cmd == "learner_apply":
+                                suggestion = data.get("suggestion", {})
+                                await bus.emit("LEARNER_APPLY_SUGGESTION", suggestion)
                         db.mark_command_processed(rid)
                 except Exception as e:
                     logger.exception(f"Command watcher error: {e}")
@@ -184,6 +187,10 @@ async def main():
                             "is_running",
                             "feedback_count",
                             "consecutive_losses",
+                            "adjustments_made",
+                            "signals_emitted",
+                            "vetoes",
+                            "approvals",
                         ]:
                             if hasattr(mod, attr):
                                 try:
@@ -203,6 +210,13 @@ async def main():
                                 metrics["recent_learner_suggestions"] = (
                                     len(recent_ls) if recent_ls is not None else 0
                                 )
+                            if name == "executor":
+                                metrics["moon_bags"] = len(
+                                    getattr(mod, "moon_bags", {})
+                                )
+                                metrics["portfolio_drawdown"] = round(
+                                    mod.get_portfolio_drawdown(), 2
+                                ) if hasattr(mod, "get_portfolio_drawdown") else 0
                         except Exception as e:
                             logger.debug(
                                 f"Failed fetching recent DB summaries for reporter: {e}"
@@ -222,7 +236,6 @@ async def main():
         watcher_task = asyncio.create_task(command_watcher())
         reporter_task = asyncio.create_task(module_reporter())
 
-        # S3: Čekáme na shutdown signál místo gather (který by blokoval navždy)
         await _shutdown_event.wait()
 
     except KeyboardInterrupt:
@@ -239,6 +252,7 @@ async def main():
             risk_guard.stop(),
             executor.stop(),
             learner.stop(),
+            health_check.stop(),
         ]
 
         if state.mode in ["BETA", "LIVE"]:

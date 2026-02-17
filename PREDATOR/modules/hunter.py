@@ -1,6 +1,5 @@
 # soubor: modules/hunter.py
-# + Dynamická strategie (STRATEGY_CHANGE event)
-# + Event logging do DB pro dashboard
+# v2.0: Opraveny min_holders (strategy-driven), dynamicke thresholds
 
 import asyncio
 import logging
@@ -50,7 +49,7 @@ class HunterModel(BaseModel):
             "min_liquidity": 2000.0,
             "min_volume_24h": 1000.0,
             "max_market_cap": 1000000.0,
-            "min_holders": 50,
+            "min_holders": 10,  # FIX: snizeno z 50 (RPC vraci max 20)
             "max_top10_holders_pct": 0.50,
         },
     )
@@ -66,6 +65,7 @@ class Hunter:
             "SOLANA_RPC_FALLBACK", "https://api.mainnet-beta.solana.com"
         )
         self.rpc_client: Optional[AsyncClient] = None
+        self.is_running = False
         self.processed_count = 0
         self.early_rejected = 0
         self.rpc_rejected = 0
@@ -78,12 +78,18 @@ class Hunter:
         self.rpc_client = AsyncClient(self.rpc_url)
         connected = await self.rpc_client.is_connected()
         if not connected:
-            logger.warning(f"Primarni RPC selhal -> fallback")
+            logger.warning("Primarni RPC selhal -> fallback")
             self.rpc_client = AsyncClient(self.rpc_fallback)
             connected = await self.rpc_client.is_connected()
         if not connected:
-            raise RuntimeError("Zadny dostupny RPC – Hunter offline")
-        logger.info(f"HUNTER START – RPC pripojen ({safe_url})")
+            raise RuntimeError("Zadny dostupny RPC - Hunter offline")
+
+        self.is_running = True
+        logger.info(f"HUNTER START - RPC pripojen ({safe_url})")
+
+        # Sync thresholds se strategii
+        self._sync_strategy_thresholds()
+
         asyncio.create_task(self._heartbeat())
         bus.subscribe("NEW_COIN_FOUND", self.evaluate)
         bus.subscribe("COIN_UPDATE", self.evaluate)
@@ -92,12 +98,21 @@ class Hunter:
         db.log_event("Hunter", "MODULE_START", "Hunter spusten a pripojen k RPC")
 
     async def stop(self):
+        self.is_running = False
         if self.rpc_client:
             await self.rpc_client.close()
         logger.info("Hunter zastaven")
 
+    def _sync_strategy_thresholds(self):
+        """Synchronizuje model thresholds se strategii."""
+        s = strategy.get()
+        self.model.thresholds["min_liquidity"] = s.min_liquidity
+        self.model.thresholds["min_volume_24h"] = s.min_volume_24h
+        self.model.thresholds["min_holders"] = s.min_holders
+        self.model.thresholds["max_top10_holders_pct"] = s.max_top10_holders_pct
+
     async def _heartbeat(self):
-        while True:
+        while self.is_running:
             await asyncio.sleep(60)
             s = strategy.get()
             logger.info(
@@ -109,13 +124,12 @@ class Hunter:
     async def _on_strategy_change(self, payload: Dict[str, Any]):
         name = payload.get("strategy", "default")
         strategy.set_strategy(name)
+        self._sync_strategy_thresholds()
         s = strategy.get()
-        # Aktualizujeme thresholds modelu podle strategie
-        self.model.thresholds["min_liquidity"] = s.min_liquidity
-        self.model.thresholds["min_volume_24h"] = s.min_volume_24h
         db.log_event(
             "Hunter", "STRATEGY_CHANGE",
-            f"Strategie: {s.name} | min_liq={s.min_liquidity} | min_score={s.min_final_score}",
+            f"Strategie: {s.name} | min_liq={s.min_liquidity} | "
+            f"min_holders={s.min_holders} | min_score={s.min_final_score}",
         )
 
     async def evaluate(self, payload: Dict[str, Any]):
@@ -138,7 +152,7 @@ class Hunter:
             self.pending_low_liq[mint] = time.time()
             return
 
-        # Dynamický threshold ze strategie
+        # Dynamicky threshold ze strategie
         s = strategy.get()
         min_score_threshold = s.min_prelim_score
 
@@ -157,9 +171,10 @@ class Hunter:
                 reject_reason = "Mint authority stale aktivni"
             elif freeze_auth is not None:
                 reject_reason = "Freeze authority stale aktivni"
-            elif holder_count < self.model.thresholds["min_holders"]:
-                reject_reason = f"Prilis malo holderu ({holder_count})"
-            elif top10_pct > self.model.thresholds["max_top10_holders_pct"]:
+            # FIX: Pouzivame min_holders ze strategie (default 10, ne 50)
+            elif holder_count < s.min_holders:
+                reject_reason = f"Prilis malo holderu ({holder_count} < {s.min_holders})"
+            elif top10_pct > s.max_top10_holders_pct:
                 reject_reason = f"Koncentrace top10: {top10_pct * 100:.1f}%"
 
             if reject_reason:
@@ -170,10 +185,10 @@ class Hunter:
                 )
                 return
 
-            holders_bonus = 15 if holder_count > 200 else 0
+            holders_bonus = 15 if holder_count > 15 else (8 if holder_count > 10 else 0)
             final_score = prelim_score + holders_bonus
 
-            # Dynamický final threshold ze strategie
+            # Dynamicky final threshold ze strategie
             if final_score > s.min_final_score:
                 validated.hunter_score = final_score
                 await bus.emit("GOOD_COIN_SELECTED", validated.dict())

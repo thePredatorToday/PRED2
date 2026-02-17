@@ -1,8 +1,7 @@
 """
-core/config.py – Systémová konfigurace (Pydantic Settings).
+core/config.py – Systemova konfigurace (Pydantic Settings).
 
-Rozšíření: přidáno VIRTUAL_BALANCE, X_API_KEY/SECRET, X_ACCESS_TOKEN/SECRET
-pro OAuth 1.0a, slippage settings.
+v2.0: Pridano HEALTH_CHECK, RAYDIUM_API, LEARNER, priority fee settings.
 """
 
 import os
@@ -13,7 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Systémová konfigurace. Hodnoty lze přebít pomocí .env."""
+    """Systemova konfigurace. Hodnoty lze prebit pomoci .env."""
 
     # Project
     PROJECT_NAME: str = "PREDATOR"
@@ -29,6 +28,7 @@ class Settings(BaseSettings):
     # API Endpoints
     DEXSCREENER_API: str = "https://api.dexscreener.com/latest/dex"
     JUPITER_API_URL: str = "https://quote-api.jup.ag/v6"
+    RAYDIUM_API_URL: str = "https://api-v3.raydium.io"
 
     # System mode
     SYSTEM_MODE: str = "SHADOW"
@@ -52,8 +52,13 @@ class Settings(BaseSettings):
     HUNTER_MIN_VOLUME: float = 1000.0
 
     # Slippage
-    SLIPPAGE_MAX_BPS: int = 500  # 5% max slippage
+    SLIPPAGE_MAX_BPS: int = 500
     PRIORITY_FEE_LAMPORTS: int = 10000
+    PRIORITY_FEE_MODE: str = "dynamic"
+
+    # Health Check
+    HEALTH_CHECK_PORT: int = 8080
+    HEALTH_CHECK_ENABLED: bool = True
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -62,12 +67,11 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
 
-    # Notifications - X (Twitter) OAuth 1.0a (4 tokeny)
+    # Notifications - X (Twitter) OAuth 1.0a
     X_API_KEY: Optional[str] = None
     X_API_SECRET: Optional[str] = None
     X_ACCESS_TOKEN: Optional[str] = None
     X_ACCESS_TOKEN_SECRET: Optional[str] = None
-    # Legacy bearer (pro čtení, ne pro POST)
     X_BEARER_TOKEN: Optional[str] = None
 
     # Notifier
@@ -76,13 +80,17 @@ class Settings(BaseSettings):
     # Wallet
     WALLET_PRIVATE_KEY: Optional[str] = None
 
+    # Learner
+    LEARNER_AUTO_APPLY: bool = True
+    LEARNER_MIN_TRADES_FOR_ADJUST: int = 10
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
 
 def _load_yaml_config() -> dict:
-    """Načte config/system.yaml pokud existuje."""
+    """Nacte config/system.yaml pokud existuje."""
     yaml_path = os.path.join(os.path.dirname(__file__), "..", "config", "system.yaml")
     if os.path.exists(yaml_path):
         with open(yaml_path, "r", encoding="utf-8") as f:
