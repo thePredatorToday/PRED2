@@ -1,4 +1,7 @@
-﻿# soubor: modules/hunter.py
+# soubor: modules/hunter.py
+# + Dynamická strategie (STRATEGY_CHANGE event)
+# + Event logging do DB pro dashboard
+
 import asyncio
 import logging
 import os
@@ -13,6 +16,8 @@ from solders.pubkey import Pubkey
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from core.event_bus import bus
+from core.database import db
+from core.strategy import strategy
 
 load_dotenv()
 
@@ -39,7 +44,6 @@ class HunterModel(BaseModel):
             "market_cap": 0.30,
             "holders": 0.10,
         },
-        description="Váhy pro skóre",
     )
     thresholds: Dict[str, float] = Field(
         default_factory=lambda: {
@@ -49,7 +53,6 @@ class HunterModel(BaseModel):
             "min_holders": 50,
             "max_top10_holders_pct": 0.50,
         },
-        description="Minimální/maximální prahy",
     )
 
 
@@ -68,132 +71,135 @@ class Hunter:
         self.rpc_rejected = 0
         self.selected_count = 0
         self.max_prelim_score = 0.0
-        self.pending_low_liq = {}  # mint -> timestamp posledního pokusu
+        self.pending_low_liq = {}
 
     async def start(self):
         safe_url = self.rpc_url.split("?")[0] if "?" in self.rpc_url else self.rpc_url
         self.rpc_client = AsyncClient(self.rpc_url)
         connected = await self.rpc_client.is_connected()
         if not connected:
-            logger.warning(
-                f"Primární RPC selhal → fallback na {self.rpc_fallback.split('?')[0]}"
-            )
+            logger.warning(f"Primarni RPC selhal -> fallback")
             self.rpc_client = AsyncClient(self.rpc_fallback)
             connected = await self.rpc_client.is_connected()
         if not connected:
-            raise RuntimeError("Žádný dostupný RPC – Hunter offline")
-        logger.info(f"🏹 HUNTER START – RPC připojen ({safe_url})")
+            raise RuntimeError("Zadny dostupny RPC – Hunter offline")
+        logger.info(f"HUNTER START – RPC pripojen ({safe_url})")
         asyncio.create_task(self._heartbeat())
         bus.subscribe("NEW_COIN_FOUND", self.evaluate)
         bus.subscribe("COIN_UPDATE", self.evaluate)
-        logger.debug("Hunter registrován na NEW_COIN_FOUND a COIN_UPDATE")
+        bus.subscribe("STRATEGY_CHANGE", self._on_strategy_change)
+
+        db.log_event("Hunter", "MODULE_START", "Hunter spusten a pripojen k RPC")
 
     async def stop(self):
         if self.rpc_client:
             await self.rpc_client.close()
-        logger.info("🛑 Hunter zastaven")
+        logger.info("Hunter zastaven")
 
     async def _heartbeat(self):
         while True:
             await asyncio.sleep(60)
+            s = strategy.get()
             logger.info(
-                f"🏹 Hunter aktivní | Zpracováno mintů: {self.processed_count} | "
-                f"Early reject: {self.early_rejected} | RPC reject: {self.rpc_rejected} | "
-                f"Propouštěno: {self.selected_count} | Max prelim score: {self.max_prelim_score:.1f}"
+                f"Hunter | Zpracovano: {self.processed_count} | "
+                f"Reject: {self.early_rejected} | RPC reject: {self.rpc_rejected} | "
+                f"Selected: {self.selected_count} | Strategy: {s.name}"
             )
+
+    async def _on_strategy_change(self, payload: Dict[str, Any]):
+        name = payload.get("strategy", "default")
+        strategy.set_strategy(name)
+        s = strategy.get()
+        # Aktualizujeme thresholds modelu podle strategie
+        self.model.thresholds["min_liquidity"] = s.min_liquidity
+        self.model.thresholds["min_volume_24h"] = s.min_volume_24h
+        db.log_event(
+            "Hunter", "STRATEGY_CHANGE",
+            f"Strategie: {s.name} | min_liq={s.min_liquidity} | min_score={s.min_final_score}",
+        )
 
     async def evaluate(self, payload: Dict[str, Any]):
         self.processed_count += 1
-        logger.debug(f"Hunter dostal event s mintem {payload.get('mint', 'N/A')}")
 
         try:
             validated = HunterPayload(**payload)
-        except ValidationError as e:
-            logger.debug(f"Nevalidní payload: {e}")
+        except ValidationError:
             self.early_rejected += 1
             return
 
         prelim_score = self._calculate_preliminary_score(validated)
         self.max_prelim_score = max(self.max_prelim_score, prelim_score)
 
-        # Pokud liquidity nízká, zařadíme do pending a zkusíme později
         if validated.liquidity < 1000:
             mint = validated.mint
             if mint in self.pending_low_liq:
-                last_try = self.pending_low_liq[mint]
-                if time.time() - last_try < 30:
-                    logger.debug(f"Pending low liq {mint} – čekám ještě")
+                if time.time() - self.pending_low_liq[mint] < 30:
                     return
             self.pending_low_liq[mint] = time.time()
-            logger.debug(
-                f"Low liquidity {validated.liquidity:.0f} – pending retry pro {mint}"
-            )
-            return  # Čekáme na další COIN_UPDATE
+            return
 
-        # SHADOW mód: Snížíme práh pro propuštění novým tokenům (jsou nové, málo dat)
-        # Produkce: zvýšit na 40-50
-        min_score_threshold = 15 if validated.liquidity < 10000 else 40
+        # Dynamický threshold ze strategie
+        s = strategy.get()
+        min_score_threshold = s.min_prelim_score
 
         if prelim_score < min_score_threshold:
-            logger.info(
-                f"Early reject {validated.name} | score {prelim_score:.1f} (low liq/vol)"
-            )
             self.early_rejected += 1
             return
 
         try:
             mint_pubkey = Pubkey.from_string(validated.mint)
-            (
-                mint_auth,
-                freeze_auth,
-                holder_count,
-                top10_pct,
-            ) = await self._rpc_audit_mint(mint_pubkey)
+            mint_auth, freeze_auth, holder_count, top10_pct = await self._rpc_audit_mint(
+                mint_pubkey
+            )
 
             reject_reason = None
             if mint_auth is not None:
-                reject_reason = "Mint authority stále aktivní"
+                reject_reason = "Mint authority stale aktivni"
             elif freeze_auth is not None:
-                reject_reason = "Freeze authority stále aktivní"
+                reject_reason = "Freeze authority stale aktivni"
             elif holder_count < self.model.thresholds["min_holders"]:
-                reject_reason = f"Příliš málo holderů ({holder_count})"
+                reject_reason = f"Prilis malo holderu ({holder_count})"
             elif top10_pct > self.model.thresholds["max_top10_holders_pct"]:
-                reject_reason = f"Koncentrace v top 10: {top10_pct * 100:.1f}%"
+                reject_reason = f"Koncentrace top10: {top10_pct * 100:.1f}%"
 
             if reject_reason:
-                logger.info(f"Reject {validated.name} | {reject_reason}")
                 self.rpc_rejected += 1
+                db.log_event(
+                    "Hunter", "REJECT",
+                    f"{validated.name} ({validated.mint[:8]}...) | {reject_reason}",
+                )
                 return
 
             holders_bonus = 15 if holder_count > 200 else 0
             final_score = prelim_score + holders_bonus
 
-            if final_score > 75:
+            # Dynamický final threshold ze strategie
+            if final_score > s.min_final_score:
                 validated.hunter_score = final_score
                 await bus.emit("GOOD_COIN_SELECTED", validated.dict())
-                logger.info(
-                    f"GOOD_COIN_SELECTED → {validated.name} | score {final_score:.1f} | holders {holder_count}"
-                )
                 self.selected_count += 1
+                db.log_event(
+                    "Hunter", "GOOD_COIN",
+                    f"SELECTED: {validated.name} | score={final_score:.1f} | "
+                    f"holders={holder_count} | liq=${validated.liquidity:.0f}",
+                    level="SUCCESS",
+                )
             else:
-                logger.debug(f"Final reject {validated.name} | score {final_score:.1f}")
                 self.rpc_rejected += 1
 
         except Exception as e:
-            logger.error(f"RPC audit selhal pro {validated.mint}: {e}", exc_info=True)
+            logger.error(f"RPC audit selhal pro {validated.mint}: {e}")
             self.rpc_rejected += 1
 
     def _calculate_preliminary_score(self, p: HunterPayload) -> float:
         w = self.model.weights
         t = self.model.thresholds
-
         liq_score = min(100, (p.liquidity / t["min_liquidity"]) * 100) * w["liquidity"]
         vol_score = min(100, (p.volume_24h / t["min_volume_24h"]) * 100) * w["volume"]
         mc_score = (
             min(100, (t["max_market_cap"] - p.market_cap) / t["max_market_cap"] * 100)
             * w["market_cap"]
         )
-
         return liq_score + vol_score + mc_score
 
     @retry(
@@ -209,7 +215,6 @@ class Hunter:
             raise ValueError(f"Mint {mint_pubkey} not found")
 
         data = acc_info.value.data
-
         mint_auth = Pubkey(data[4:36]) if data[4:8] != b"\x00\x00\x00\x00" else None
         freeze_auth = (
             Pubkey(data[36:68]) if data[36:40] != b"\x00\x00\x00\x00" else None
@@ -229,9 +234,8 @@ class Hunter:
         try:
             updated = HunterModel(**new_model)
             self.model = updated
-            logger.info(f"Hunter model aktualizován – nové váhy: {self.model.weights}")
         except ValidationError as e:
-            logger.error(f"Nevalidní update modelu: {e}")
+            logger.error(f"Nevalidni update modelu: {e}")
 
 
 hunter = Hunter()

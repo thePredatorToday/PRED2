@@ -1,8 +1,7 @@
 # soubor: modules/risk_guard.py
-# Opravy:
-# - L2: min_score sjednocen na 80 (dle specifikace)
-# - L7: _veto je nyní async (volá bus.emit)
-# - Vylepšený drawdown check dle settings
+# + Dynamická strategie (reaguje na STRATEGY_CHANGE)
+# + Event logging do DB pro dashboard
+
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -12,6 +11,8 @@ from typing import Any, Dict, Optional
 from core.event_bus import bus
 from core.system_state import state
 from core.config import settings
+from core.database import db
+from core.strategy import strategy
 
 logger = logging.getLogger("Predator.RiskGuard")
 
@@ -35,11 +36,13 @@ class RiskGuard:
 
     async def start(self):
         self.is_running = True
-        logger.info("RISKGUARD START – Brana veto aktivovana")
+        logger.info("RISKGUARD START")
 
         bus.subscribe("TRADE_SIGNAL_READY", self.check_risk)
+        bus.subscribe("STRATEGY_CHANGE", self._on_strategy_change)
 
         asyncio.create_task(self._heartbeat())
+        db.log_event("RiskGuard", "MODULE_START", "RiskGuard spusten")
 
     async def stop(self):
         self.is_running = False
@@ -48,53 +51,62 @@ class RiskGuard:
     async def _heartbeat(self):
         while self.is_running:
             await asyncio.sleep(60)
+            s = strategy.get()
             logger.info(
-                f"RiskGuard aktivni | Zpracovano: {self.processed_signals} | "
-                f"Schvaleno: {self.approvals} | Veto: {self.vetoes}"
+                f"RiskGuard | Zpracovano: {self.processed_signals} | "
+                f"Schvaleno: {self.approvals} | Veto: {self.vetoes} | "
+                f"Min score: {s.risk_min_score}"
             )
+
+    async def _on_strategy_change(self, payload: Dict[str, Any]):
+        name = payload.get("strategy", "default")
+        strategy.set_strategy(name)
+        s = strategy.get()
+        db.log_event(
+            "RiskGuard", "STRATEGY_CHANGE",
+            f"Strategie: {s.name} | min_score={s.risk_min_score} | "
+            f"max_pos={s.max_position_size} SOL | max_open={s.max_open_positions}",
+        )
 
     async def check_risk(self, signal_data: Dict[str, Any]):
         self.processed_signals += 1
         address = signal_data.get("token_address")
         score = signal_data.get("score", 0)
+        s = strategy.get()
 
-        logger.info(f"Proveruji riziko pro {address} (skore {score:.1f})")
+        logger.info(f"Risk check: {address} (score {score:.1f})")
 
-        # 1. Kontrola stavu systému
+        # 1. System status
         if state.status in ["KILL_SWITCH", "ERROR", "PAUSED"]:
-            return await self._veto(address, f"System v nouzovem stavu: {state.status}", signal_data)
+            return await self._veto(address, f"System stav: {state.status}", signal_data)
 
-        # 2. Kontrola denního drawdownu (dle settings)
+        # 2. Drawdown
         drawdown_limit = abs(settings.DAILY_DRAWDOWN_PCT)
         if state.daily_pnl <= -drawdown_limit:
             state.status = "KILL_SWITCH"
             state.save()
-            return await self._veto(address, f"Dosazen limit denniho drawdownu (-{drawdown_limit}%)", signal_data)
+            return await self._veto(address, f"Drawdown limit (-{drawdown_limit}%)", signal_data)
 
-        # 3. Kontrola počtu otevřených pozic
-        if state.open_positions >= settings.MAX_OPEN_POSITIONS:
-            return await self._veto(address, f"Dosazen max pocet pozic ({state.open_positions})", signal_data)
+        # 3. Max pozic (ze strategie)
+        if state.open_positions >= s.max_open_positions:
+            return await self._veto(address, f"Max pozic ({state.open_positions}/{s.max_open_positions})", signal_data)
 
-        # L2: Kontrola minimálního skóre Analyzera (80 dle specifikace)
-        min_score = 80
-        if score < min_score:
-            return await self._veto(address, f"Nedostatecne skore Analyzera ({score:.1f} < {min_score})", signal_data)
+        # 4. Min skóre (ze strategie)
+        if score < s.risk_min_score:
+            return await self._veto(address, f"Score {score:.1f} < {s.risk_min_score}", signal_data)
 
-        # 5. Výpočet velikosti pozice
-        amount = 0.1 if state.mode == "BETA" else settings.MAX_POSITION_SIZE
-        # Dynamické snížení pokud je balanc nízký
+        # 5. Velikost pozice (ze strategie)
+        amount = 0.1 if state.mode == "BETA" else s.max_position_size
         if state.balance_sol < (amount + state.solana_reserve):
             if state.balance_sol > (0.05 + state.solana_reserve):
                 amount = 0.05
-                logger.warning(f"Snizena velikost pozice na {amount} SOL kvuli nizkemu balancu")
             else:
-                return await self._veto(address, f"Nedostatecny balanc ({state.balance_sol:.4f} SOL)", signal_data)
+                return await self._veto(address, f"Low balance ({state.balance_sol:.4f} SOL)", signal_data)
 
-        # 6. Kontrola rezervy
+        # 6. Rezerva
         if (state.balance_sol - amount) < state.solana_reserve:
-            return await self._veto(address, "Transakce by narusila SOL rezervu", signal_data)
+            return await self._veto(address, "SOL rezerva by byla narusena", signal_data)
 
-        # Pokud vše prošlo
         return await self._approve(address, amount, signal_data)
 
     async def _approve(self, address: str, amount: float, signal_data: Dict[str, Any]):
@@ -103,18 +115,27 @@ class RiskGuard:
             token_address=address,
             amount_sol=amount,
             approved=True,
-            reason="Vsechny rizikove kontroly v poradku",
+            reason="Vsechny kontroly OK",
             original_signal=signal_data,
         )
 
-        logger.info(f"RISK_APPROVED -> {address} | Pozice: {amount} SOL")
+        logger.info(f"APPROVED: {address} | {amount} SOL")
+        db.log_event(
+            "RiskGuard", "APPROVED",
+            f"APPROVED: {address} | {amount} SOL | score={signal_data.get('score', 0):.1f}",
+            level="SUCCESS",
+        )
         await bus.emit("RISK_APPROVED_FOR_EXECUTION", approved_signal.__dict__)
         return True
 
-    # L7: _veto je nyní async (předtím sync + create_task pro emit → problém)
     async def _veto(self, address: str, reason: str, signal_data: Dict[str, Any]):
         self.vetoes += 1
-        logger.warning(f"RISK_VETO -> {address} | Duvod: {reason}")
+        logger.warning(f"VETO: {address} | {reason}")
+        db.log_event(
+            "RiskGuard", "VETO",
+            f"VETO: {address} | {reason}",
+            level="WARNING",
+        )
         await bus.emit(
             "RISK_VETOED",
             {
