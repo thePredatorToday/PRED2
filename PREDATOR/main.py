@@ -16,6 +16,7 @@ from core.event_bus import bus
 from core.logging import setup_logging
 from core.system_state import state
 from core.database import db
+from core.strategy import strategy
 from modules.hunter import Hunter
 from modules.miner import Miner
 from modules.analyzer import analyzer
@@ -147,9 +148,14 @@ async def main():
                                 else:
                                     stop_module_sync(mod)
                         elif action == "strategy_change":
-                            strategy = data.get("strategy")
+                            strat_name = data.get("strategy")
+                            strategy.set_strategy(strat_name)
                             await bus.emit(
-                                "STRATEGY_CHANGE", {"strategy": strategy}
+                                "STRATEGY_CHANGE", {"strategy": strat_name}
+                            )
+                            db.log_event(
+                                "System", "STRATEGY_CHANGE",
+                                f"Strategie zmenena na: {strat_name}",
                             )
                         elif action == "system_cmd":
                             cmd = data.get("cmd")
