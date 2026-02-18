@@ -1,6 +1,7 @@
 # soubor: modules/executor.py
-# v2.0: Moon Bag, DCA, TX simulace, Raydium fallback,
+# v2.1: Moon Bag, DCA, TX simulace, Raydium fallback,
 #       slippage validace, dynamicke priority fees
+#       FIX: asyncio.Lock pro state, DCA avg_price math, refactor
 
 import asyncio
 import base64
@@ -13,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from core.event_bus import bus
-from core.system_state import state
+from core.system_state import state, get_state_lock
 from core.database import db
 from core.config import settings
 from core.strategy import strategy
@@ -445,10 +446,12 @@ class Executor:
 
         self.trade_count += 1
         self.dca_entries[address] = 0
-        state.open_positions = len(self.active_positions)
-        state.balance_sol -= amount_sol
-        self._update_peak_balance()
-        state.save()
+        # FIX: atomicke state updates s lockem
+        async with get_state_lock():
+            state.open_positions = len(self.active_positions)
+            state.balance_sol -= amount_sol
+            self._update_peak_balance()
+            state.save()
 
         logger.info(f"POSITION OPENED: {address} at {entry_price} via {dex_source}")
 
@@ -529,16 +532,18 @@ class Executor:
         pos["amount_sol"] += dca_amount
         pos["dca_count"] += 1
 
-        # Prepocitame prumernou vstupni cenu
+        # Prepocitame prumernou vstupni cenu (SOL per token)
+        # FIX: odstraneno * LAMPORTS_PER_SOL - cena je v SOL, ne lamports
         if pos["token_amount"] > 0:
-            pos["avg_entry_price"] = pos["total_invested_sol"] / pos["token_amount"] * LAMPORTS_PER_SOL
+            pos["avg_entry_price"] = pos["total_invested_sol"] / pos["token_amount"]
         pos["entry_price"] = pos["avg_entry_price"]
 
         self.dca_entries[address] = current_entries + 1
 
-        state.balance_sol -= dca_amount
-        self._update_peak_balance()
-        state.save()
+        async with get_state_lock():
+            state.balance_sol -= dca_amount
+            self._update_peak_balance()
+            state.save()
 
         db.log_event(
             "Executor", "DCA_ENTRY",
@@ -628,12 +633,13 @@ class Executor:
                 if tx_signature:
                     actual_sol_received = int(quote.get("outAmount", 0)) / LAMPORTS_PER_SOL
 
-        # Aktualizujeme balanc
+        # Aktualizujeme balanc (s lockem)
         profit_sol = actual_sol_received - sell_sol
-        state.balance_sol += actual_sol_received
-        state.daily_pnl += profit_sol
-        self._update_peak_balance()
-        state.save()
+        async with get_state_lock():
+            state.balance_sol += actual_sol_received
+            state.daily_pnl += profit_sol
+            self._update_peak_balance()
+            state.save()
 
         # Vytvorime moon bag pozici
         self.moon_bags[address] = {
@@ -650,8 +656,9 @@ class Executor:
 
         # Odstranime z active positions
         self.active_positions.pop(address, None)
-        state.open_positions = len(self.active_positions)
-        state.save()
+        async with get_state_lock():
+            state.open_positions = len(self.active_positions)
+            state.save()
 
         db.log_event(
             "Executor", "MOON_BAG_TRIGGER",
@@ -727,10 +734,11 @@ class Executor:
                     actual_sol = int(quote.get("outAmount", 0)) / LAMPORTS_PER_SOL
                     profit_sol = actual_sol - bag["original_sol"]
 
-        state.balance_sol += bag["original_sol"] + profit_sol
-        state.daily_pnl += profit_sol
-        self._update_peak_balance()
-        state.save()
+        async with get_state_lock():
+            state.balance_sol += bag["original_sol"] + profit_sol
+            state.daily_pnl += profit_sol
+            self._update_peak_balance()
+            state.save()
 
         logger.info(
             f"MOON BAG EXIT: {address} | {reason} | {profit_pct:.2f}% ({profit_sol:+.4f} SOL)"
@@ -808,11 +816,12 @@ class Executor:
             level="SUCCESS" if profit_sol >= 0 else "WARNING",
         )
 
-        state.open_positions = len(self.active_positions)
-        state.balance_sol += pos["amount_sol"] + profit_sol
-        state.daily_pnl += profit_sol
-        self._update_peak_balance()
-        state.save()
+        async with get_state_lock():
+            state.open_positions = len(self.active_positions)
+            state.balance_sol += pos["amount_sol"] + profit_sol
+            state.daily_pnl += profit_sol
+            self._update_peak_balance()
+            state.save()
 
         # Cleanup DCA entries
         self.dca_entries.pop(address, None)

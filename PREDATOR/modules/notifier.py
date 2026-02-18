@@ -1,23 +1,16 @@
 # soubor: modules/notifier.py
-# Opravy:
+# v2.1: OAuth 1.0a pres authlib (nahrazuje manualni HMAC-SHA1)
 # - L6: Používá singleton `db` z core.database místo nové instance Database()
 # - L6: Konfig z core.config.settings místo přímého os.getenv
-# - B7+S5: X API implementováno s OAuth 1.0a (authlib) místo Bearer tokenu
 import asyncio
-import hashlib
-import hmac
 import logging
-import time
-import urllib.parse
-import base64
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import httpx
 
-from core.database import db  # L6: singleton DB, ne nová instance
-from core.config import settings  # L6: konfigurace ze settings
+from core.database import db
+from core.config import settings
 from core.event_bus import bus
 
 logger = logging.getLogger("Predator.Notifier")
@@ -199,66 +192,28 @@ class Notifier:
         except Exception:
             logger.exception("Failed sending Telegram message")
 
-    # B7+S5: OAuth 1.0a implementace pro X (Twitter) POST /2/tweets
     async def _send_x_oauth(self, message: str):
-        """Post tweet pomocí OAuth 1.0a (manuální HMAC-SHA1 signing)."""
+        """Post tweet pres OAuth 1.0a s authlib (spravne generuje nonce/timestamp/signature)."""
         try:
-            url = "https://api.twitter.com/2/tweets"
-            method = "POST"
+            from authlib.integrations.httpx_client import AsyncOAuth1Client
 
-            # Truncate na 280 znaků (Twitter limit)
+            url = "https://api.twitter.com/2/tweets"
             tweet_text = message[:280]
 
-            # OAuth 1.0a parametry
-            oauth_params = {
-                "oauth_consumer_key": settings.X_API_KEY,
-                "oauth_nonce": secrets.token_hex(16),
-                "oauth_signature_method": "HMAC-SHA1",
-                "oauth_timestamp": str(int(time.time())),
-                "oauth_token": settings.X_ACCESS_TOKEN,
-                "oauth_version": "1.0",
-            }
-
-            # Signature base string
-            all_params = dict(oauth_params)
-            param_string = "&".join(
-                f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
-                for k, v in sorted(all_params.items())
-            )
-            base_string = f"{method}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(param_string, safe='')}"
-
-            signing_key = (
-                f"{urllib.parse.quote(settings.X_API_SECRET, safe='')}"
-                f"&{urllib.parse.quote(settings.X_ACCESS_TOKEN_SECRET, safe='')}"
-            )
-
-            signature = base64.b64encode(
-                hmac.new(
-                    signing_key.encode("utf-8"),
-                    base_string.encode("utf-8"),
-                    hashlib.sha1,
-                ).digest()
-            ).decode("utf-8")
-
-            oauth_params["oauth_signature"] = signature
-
-            auth_header = "OAuth " + ", ".join(
-                f'{urllib.parse.quote(k, safe="")}="{urllib.parse.quote(v, safe="")}"'
-                for k, v in sorted(oauth_params.items())
-            )
-
-            headers = {
-                "Authorization": auth_header,
-                "Content-Type": "application/json",
-            }
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, json={"text": tweet_text}, headers=headers)
+            async with AsyncOAuth1Client(
+                client_id=settings.X_API_KEY,
+                client_secret=settings.X_API_SECRET,
+                token=settings.X_ACCESS_TOKEN,
+                token_secret=settings.X_ACCESS_TOKEN_SECRET,
+            ) as client:
+                resp = await client.post(url, json={"text": tweet_text})
                 if resp.status_code in (200, 201):
                     logger.info("X tweet posted successfully")
                 else:
                     logger.warning(f"X API responded {resp.status_code}: {resp.text[:200]}")
 
+        except ImportError:
+            logger.error("authlib not installed - pip install authlib")
         except Exception:
             logger.exception("Failed sending X message via OAuth 1.0a")
 

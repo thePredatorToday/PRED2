@@ -56,14 +56,17 @@ class Miner:
 
     async def start(self):
         self.is_running = True
-        logger.info("🚀 MINER START – Pump.fun WS + DexScreener fallback aktivován")
+        logger.info("MINER START - Pump.fun WS + DexScreener fallback aktivovan")
         logger.info(
             f"Scan intervaly: HIGH 5s | LOW 300s | DEAD purge < ${DEAD_LIQUIDITY_THRESHOLD}"
         )
         asyncio.create_task(self.pump_fun_ws_listener())
         asyncio.create_task(self.scan_loop())
         asyncio.create_task(self._heartbeat())
-        await asyncio.Event().wait()
+        # FIX: puvodni asyncio.Event().wait() blokoval navzdy (event nikdy set)
+        # Nyni pouzivame is_running loop se sleep
+        while self.is_running:
+            await asyncio.sleep(1)
 
     async def stop(self):
         self.is_running = False
@@ -269,11 +272,23 @@ class Miner:
         return False
 
     def _cleanup_dedup(self):
-        """M1: Periodický cleanup starých dedup záznamů."""
+        """M1: Periodicky cleanup starych dedup zaznamu."""
         now = time.time()
         expired = [k for k, ts in self.dedup_set.items() if now - ts > self.dedup_ttl]
         for k in expired:
             del self.dedup_set[k]
+
+        # Cleanup priority_queue - max 5000 zaznamu, odstranit nejstarsi
+        max_queue_size = 5000
+        if len(self.priority_queue) > max_queue_size:
+            sorted_mints = sorted(
+                self.priority_queue.items(),
+                key=lambda x: x[1].get("last_scan", 0),
+            )
+            to_remove = len(self.priority_queue) - max_queue_size
+            for mint, _ in sorted_mints[:to_remove]:
+                del self.priority_queue[mint]
+            logger.info(f"Priority queue cleanup: odstraneno {to_remove} zaznamu")
 
 
 if __name__ == "__main__":

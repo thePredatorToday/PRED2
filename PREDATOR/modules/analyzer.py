@@ -1,5 +1,5 @@
 # soubor: modules/analyzer.py
-# v2.0: LP Lock verifikace (Raydium pool check), vylepseny scoring
+# v2.1: LP Lock verifikace, circuit breaker pro RPC/API, vylepseny scoring
 
 import asyncio
 from asyncio import Lock
@@ -23,6 +23,7 @@ from core.event_bus import bus
 from core.config import settings
 from core.database import db
 from core.strategy import strategy
+from core.circuit_breaker import CircuitBreaker
 
 load_dotenv()
 
@@ -61,6 +62,9 @@ class Analyzer:
         self.rejected_count = 0
         self.history: Dict[str, List[Dict[str, Any]]] = {}
         self.history_lock = Lock()
+        # Circuit breaker pro RPC a externi API
+        self.rpc_cb = CircuitBreaker("analyzer_rpc", failure_threshold=5, recovery_timeout=60)
+        self.api_cb = CircuitBreaker("analyzer_api", failure_threshold=3, recovery_timeout=30)
 
     async def start(self):
         self.rpc_client = AsyncClient(self.rpc_url)
@@ -132,6 +136,12 @@ class Analyzer:
         address = payload.get("mint")
         logger.info(f"Audit: {address}")
 
+        # Circuit breaker check
+        if not self.rpc_cb.can_execute():
+            logger.debug(f"RPC circuit breaker OPEN - skip analyzer audit {address[:8]}")
+            self.rejected_count += 1
+            return
+
         try:
             token_pubkey = Pubkey.from_string(address)
 
@@ -142,6 +152,7 @@ class Analyzer:
 
             audit_results = await audit_task
             lp_locked, lp_score, lp_flags = await lp_task
+            self.rpc_cb.record_success()
 
             scores = {}
             flags = history_flags + audit_results["flags"] + lp_flags
@@ -193,6 +204,7 @@ class Analyzer:
                 )
 
         except Exception as e:
+            self.rpc_cb.record_failure()
             logger.error(f"Audit error {address}: {e}", exc_info=True)
 
     # ──────────────── LP LOCK VERIFICATION ────────────────
@@ -213,7 +225,7 @@ class Analyzer:
 
         # Metoda 1: DexScreener API check
         try:
-            if self.http_client:
+            if self.http_client and self.api_cb.can_execute():
                 resp = await self.http_client.get(
                     f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
                     timeout=5.0,
@@ -242,7 +254,9 @@ class Analyzer:
                         else:
                             score = 30.0
                             flags.append("LOW_LIQUIDITY_POOL")
+                self.api_cb.record_success()
         except Exception as e:
+            self.api_cb.record_failure()
             logger.debug(f"DexScreener LP check failed: {e}")
 
         # Metoda 2: RPC - kontrola LP token ownership

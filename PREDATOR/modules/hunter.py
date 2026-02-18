@@ -1,5 +1,5 @@
 # soubor: modules/hunter.py
-# v2.0: Opraveny min_holders (strategy-driven), dynamicke thresholds
+# v2.1: Opraveny min_holders, dynamicke thresholds, circuit breaker
 
 import asyncio
 import logging
@@ -17,6 +17,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from core.event_bus import bus
 from core.database import db
 from core.strategy import strategy
+from core.circuit_breaker import CircuitBreaker
 
 load_dotenv()
 
@@ -72,6 +73,8 @@ class Hunter:
         self.selected_count = 0
         self.max_prelim_score = 0.0
         self.pending_low_liq = {}
+        # Circuit breaker pro RPC
+        self.rpc_cb = CircuitBreaker("hunter_rpc", failure_threshold=5, recovery_timeout=60)
 
     async def start(self):
         safe_url = self.rpc_url.split("?")[0] if "?" in self.rpc_url else self.rpc_url
@@ -160,11 +163,18 @@ class Hunter:
             self.early_rejected += 1
             return
 
+        # Circuit breaker check
+        if not self.rpc_cb.can_execute():
+            logger.debug(f"RPC circuit breaker OPEN - skip {validated.mint[:8]}")
+            self.rpc_rejected += 1
+            return
+
         try:
             mint_pubkey = Pubkey.from_string(validated.mint)
             mint_auth, freeze_auth, holder_count, top10_pct = await self._rpc_audit_mint(
                 mint_pubkey
             )
+            self.rpc_cb.record_success()
 
             reject_reason = None
             if mint_auth is not None:
@@ -204,6 +214,7 @@ class Hunter:
 
         except Exception as e:
             logger.error(f"RPC audit selhal pro {validated.mint}: {e}")
+            self.rpc_cb.record_failure()
             self.rpc_rejected += 1
 
     def _calculate_preliminary_score(self, p: HunterPayload) -> float:

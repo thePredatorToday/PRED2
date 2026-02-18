@@ -1,12 +1,10 @@
 """
-core/system_state.py – Globální stav systému.
+core/system_state.py – Globalni stav systemu.
 
-Opravy:
-- B5: Výchozí balance_sol z VIRTUAL_BALANCE_SOL pro SHADOW/PAPER mód
-- Opravený save() – sqlite3.Connection není context manager pro commit
-- Bezpečnější load() s fallbackem
+v2.0: asyncio.Lock pro thread-safe aktualizace balance/positions.
 """
 
+import asyncio
 import json
 import logging
 from dataclasses import asdict, dataclass, field
@@ -17,6 +15,14 @@ from core.database import db
 from core.config import settings
 
 logger = logging.getLogger("Predator.SystemState")
+
+# Globalni lock pro atomicke operace se stavem
+_state_lock = asyncio.Lock()
+
+
+def get_state_lock() -> asyncio.Lock:
+    """Vrati globalni state lock pro pouziti v modulech."""
+    return _state_lock
 
 
 @dataclass
@@ -32,7 +38,7 @@ class SystemState:
     error_state: Optional[str] = None
 
     def save(self):
-        """Uloží stav do DB."""
+        """Ulozi stav do DB."""
         self.last_update = datetime.utcnow()
         try:
             conn = db.connect()
@@ -49,9 +55,29 @@ class SystemState:
         except Exception as e:
             logger.error(f"Chyba pri ukladani stavu: {e}")
 
+    async def update_balance(self, delta_sol: float, reason: str = ""):
+        """Atomicka aktualizace balance s lockem."""
+        async with _state_lock:
+            self.balance_sol += delta_sol
+            self.save()
+            if reason:
+                logger.debug(f"Balance update: {delta_sol:+.4f} SOL ({reason}) -> {self.balance_sol:.4f}")
+
+    async def update_positions(self, count: int):
+        """Atomicka aktualizace poctu pozic."""
+        async with _state_lock:
+            self.open_positions = count
+            self.save()
+
+    async def update_pnl(self, pnl_delta: float):
+        """Atomicka aktualizace daily PnL."""
+        async with _state_lock:
+            self.daily_pnl += pnl_delta
+            self.save()
+
     @classmethod
     def load(cls) -> "SystemState":
-        """Načte stav z DB nebo vytvoří výchozí."""
+        """Nacte stav z DB nebo vytvori vychozi."""
         try:
             conn = db.connect()
             cursor = conn.cursor()
@@ -66,7 +92,6 @@ class SystemState:
         except Exception as e:
             logger.warning(f"Nelze nacist stav z DB, vytvarim vychozi: {e}")
 
-        # B5: Výchozí stav - virtuální balance pro SHADOW/PAPER mód
         mode = settings.SYSTEM_MODE
         balance = settings.VIRTUAL_BALANCE_SOL if mode in ("SHADOW", "PAPER") else 0.0
         return cls(
