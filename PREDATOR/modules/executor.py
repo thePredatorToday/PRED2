@@ -1,7 +1,9 @@
 # soubor: modules/executor.py
-# v2.1: Moon Bag, DCA, TX simulace, Raydium fallback,
+# v2.2: Moon Bag, DCA, TX simulace, Raydium fallback,
 #       slippage validace, dynamicke priority fees
-#       FIX: asyncio.Lock pro state, DCA avg_price math, refactor
+#       FIX: asyncio.Lock pro state, DCA avg_price math
+#       FIX: vlastni cenovy monitor (nezavisly na Mineru)
+#       FIX: reload pozic z DB po restartu
 
 import asyncio
 import base64
@@ -50,16 +52,29 @@ class Executor:
         self.peak_balance = state.balance_sol
         logger.info(f"EXECUTOR START - Mod: {state.mode} | Strategy: {strategy.get().name}")
 
+        # Reload open positions from DB (survives restart)
+        self._reload_positions_from_db()
+
         bus.subscribe("RISK_APPROVED_FOR_EXECUTION", self.execute_trade)
         bus.subscribe("COIN_UPDATE", self._monitor_positions)
         bus.subscribe("STRATEGY_CHANGE", self._on_strategy_change)
 
         asyncio.create_task(self._heartbeat())
+        # Dedicated price monitor - polls DexScreener for all open positions
+        # Independent of Miner - ensures positions always get price updates
+        asyncio.create_task(self._price_monitor_loop())
 
         db.log_event("Executor", "MODULE_START", f"Executor spusten v modu {state.mode}")
 
     async def stop(self):
         self.is_running = False
+        # Persist open positions count before shutdown
+        open_count = len(self.active_positions) + len(self.moon_bags)
+        if open_count > 0:
+            logger.info(
+                f"Executor shutdown with {len(self.active_positions)} active + "
+                f"{len(self.moon_bags)} moon bags open (will reload on restart)"
+            )
         if self.http_client:
             await self.http_client.aclose()
         logger.info("Executor zastaven")
@@ -74,6 +89,102 @@ class Executor:
                 f"Obchodu: {self.trade_count} | SL: {s.stop_loss_pct}% | "
                 f"TP: {s.take_profit_pct}%"
             )
+
+    # ──────────────── POSITION RELOAD FROM DB ────────────────
+
+    def _reload_positions_from_db(self):
+        """Reload open positions from trades table after restart."""
+        try:
+            conn = db.connect()
+            cursor = conn.execute(
+                "SELECT mint, entry_price, status, timestamp FROM trades "
+                "WHERE status = 'OPEN' OR status = 'POSITION_OPEN'"
+            )
+            rows = cursor.fetchall()
+            reloaded = 0
+            for mint, entry_price, status, ts in rows:
+                if mint not in self.active_positions:
+                    self.active_positions[mint] = {
+                        "token_address": mint,
+                        "entry_price": entry_price or 0,
+                        "current_price": entry_price or 0,
+                        "amount_sol": 0.1,  # default, exact amount not stored
+                        "token_amount": 0,
+                        "highest_price": entry_price or 0,
+                        "status": "MONITORING",
+                        "opened_at": ts or datetime.utcnow().isoformat(),
+                        "total_invested_sol": 0.1,
+                        "dca_count": 0,
+                    }
+                    reloaded += 1
+            if reloaded > 0:
+                logger.info(f"Reloaded {reloaded} open positions from DB")
+                db.log_event(
+                    "Executor", "POSITIONS_RELOADED",
+                    f"Nacteno {reloaded} otevrenych pozic z DB po restartu",
+                )
+        except Exception as e:
+            logger.warning(f"Failed to reload positions from DB: {e}")
+
+    # ──────────────── DEDICATED PRICE MONITOR ────────────────
+
+    async def _price_monitor_loop(self):
+        """
+        Independent price polling for ALL open positions.
+        Polls DexScreener every 5s. Does NOT depend on Miner.
+        This ensures positions always get price updates even if Miner
+        stops scanning a token (purge, cleanup, restart).
+        """
+        while self.is_running:
+            try:
+                # Collect all mints to monitor
+                mints_to_check = list(self.active_positions.keys()) + list(self.moon_bags.keys())
+                if not mints_to_check:
+                    await asyncio.sleep(5)
+                    continue
+
+                for mint in mints_to_check:
+                    if not self.is_running:
+                        break
+                    try:
+                        price = await self._fetch_current_price(mint)
+                        if price and price > 0:
+                            # Create synthetic COIN_UPDATE and feed it to monitor
+                            update = {
+                                "mint": mint,
+                                "price": price,
+                                "source": "price_monitor",
+                            }
+                            await self._monitor_positions(update)
+                    except Exception as e:
+                        logger.debug(f"Price monitor error for {mint[:8]}: {e}")
+
+                    # Small delay between tokens to avoid rate limiting
+                    await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Price monitor loop error: {e}")
+
+            await asyncio.sleep(5)
+
+    async def _fetch_current_price(self, mint: str) -> Optional[float]:
+        """Fetch current token price from DexScreener."""
+        if not self.http_client:
+            return None
+        try:
+            resp = await self.http_client.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get("pairs", [])
+                if pairs:
+                    price_str = pairs[0].get("priceUsd", "0")
+                    return float(price_str) if price_str else None
+        except Exception:
+            pass
+        return None
 
     async def _on_strategy_change(self, payload: Dict[str, Any]):
         name = payload.get("strategy", "default")
