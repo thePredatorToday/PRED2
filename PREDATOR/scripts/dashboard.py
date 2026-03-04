@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+import html as html_mod
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -184,15 +185,23 @@ html, body, [data-testid='stAppViewContainer'] {
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    animation: pulse 2s ease-in-out infinite;
+    animation: pulse-green 2s ease-in-out infinite;
 }
-.pulse-green { background: var(--accent-green); }
-.pulse-amber { background: var(--accent-amber); }
-.pulse-red { background: var(--accent-red); }
+.pulse-green { background: var(--accent-green); animation-name: pulse-green; }
+.pulse-amber { background: var(--accent-amber); animation-name: pulse-amber; }
+.pulse-red { background: var(--accent-red); animation-name: pulse-red; }
 
-@keyframes pulse {
+@keyframes pulse-green {
     0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(16,185,129,0.4); }
     50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+}
+@keyframes pulse-amber {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(245,158,11,0.4); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(245,158,11,0); }
+}
+@keyframes pulse-red {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(239,68,68,0); }
 }
 
 /* ─── KPI Cards ─── */
@@ -729,15 +738,15 @@ def render_sidebar() -> Dict[str, Any]:
     if c1.button("Start", use_container_width=True):
         if db:
             db.push_command("set_status", '{"status":"RUNNING"}')
-            st.toast("System: RUNNING", icon=":")
+            st.toast("System: RUNNING", icon="\u2705")
     if c2.button("Pause", use_container_width=True):
         if db:
             db.push_command("set_status", '{"status":"PAUSED"}')
-            st.toast("System: PAUSED", icon=":")
+            st.toast("System: PAUSED", icon="\u2705")
     if c3.button("Stop", use_container_width=True):
         if db:
             db.push_command("system_cmd", '{"cmd":"stop_all"}')
-            st.toast("System: STOPPING", icon=":")
+            st.toast("System: STOPPING", icon="\u2705")
 
     # ── Mode ──
     st.sidebar.markdown('<div class="sb-section">Trading Mode</div>', unsafe_allow_html=True)
@@ -751,7 +760,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.session_state.mode = selected_mode
         if db:
             db.push_command("set_mode", json.dumps({"mode": selected_mode}))
-            st.toast(f"Mode: {selected_mode}", icon=":")
+            st.toast(f"Mode: {selected_mode}", icon="\u2705")
 
     mode_desc = {
         "SHADOW": "Observe only. No trades executed. Safe for testing.",
@@ -773,7 +782,7 @@ def render_sidebar() -> Dict[str, Any]:
         st.session_state.strategy = selected_strat
         if db:
             db.push_command("strategy_change", json.dumps({"strategy": selected_strat}))
-            st.toast(f"Strategy: {selected_strat}", icon=":")
+            st.toast(f"Strategy: {selected_strat}", icon="\u2705")
 
     if PROFILES and selected_strat in PROFILES:
         p = PROFILES[selected_strat]
@@ -935,16 +944,17 @@ def render_kpis(s: Dict, trades_df: pd.DataFrame):
     if total > 0:
         total_wins_val = closed[closed["profit_pct"] > 0]["profit_pct"].sum()
         total_losses_val = abs(closed[closed["profit_pct"] < 0]["profit_pct"].sum())
-        pf = total_wins_val / total_losses_val if total_losses_val > 0 else 0
+        pf = total_wins_val / total_losses_val if total_losses_val > 0 else float("inf")
         pf_c = "c-green" if pf >= 1.5 else "c-amber" if pf >= 1.0 else "c-red"
     else:
         pf = 0
         pf_c = "c-muted"
+    pf_display = f"{pf:.2f}" if pf != float("inf") else "INF"
     with cols[5]:
         st.markdown(
             f'<div class="kpi-card">'
             f'<div class="kpi-label">Profit Factor</div>'
-            f'<div class="kpi-value {pf_c}">{pf:.2f}</div>'
+            f'<div class="kpi-value {pf_c}">{pf_display}</div>'
             f'<div class="kpi-sub">wins / losses</div>'
             f'</div>',
             unsafe_allow_html=True,
@@ -1130,7 +1140,7 @@ def render_event_log():
     with lc2:
         filter_module = st.selectbox(
             "Module",
-            ["All", "Miner", "Hunter", "Analyzer", "RiskGuard", "Executor", "Learner", "Notifier", "System"],
+            ["All", "Miner", "Hunter", "Analyzer", "RiskGuard", "Executor", "Learner", "Notifier", "HealthCheck", "System"],
             label_visibility="collapsed",
             key="log_filter",
         )
@@ -1147,11 +1157,14 @@ def render_event_log():
                 "SUCCESS": "log-ok", "WARNING": "log-warn",
                 "ERROR": "log-err",
             }.get(level, "log-info")
+            mod = html_mod.escape(str(e["module"]))
+            etype = html_mod.escape(str(e["type"]))
+            msg = html_mod.escape(str(e["message"]))
             line = (
                 f'<span class="log-ts">{ts}</span> '
-                f'<span class="log-mod">[{e["module"]}]</span> '
-                f'<span class="{level_cls}">{e["type"]}</span> '
-                f'<span class="log-msg">{e["message"]}</span>'
+                f'<span class="log-mod">[{mod}]</span> '
+                f'<span class="{level_cls}">{etype}</span> '
+                f'<span class="log-msg">{msg}</span>'
             )
             lines.append(line)
         log_html = "<br>".join(lines)
@@ -1241,7 +1254,7 @@ def render_learner_insights():
         )
         for sug in suggestions:
             ts = str(sug.get("time", ""))[-8:]
-            text = sug.get("suggestion", "")
+            text = html_mod.escape(str(sug.get("suggestion", "")))
             if len(text) > 80:
                 text = text[:80] + "..."
             st.markdown(
@@ -1379,9 +1392,6 @@ def main():
 
     # ════════════ TAB: TRADES ════════════
     with tab_trades:
-        render_kpis(s, trades)
-        st.markdown("")
-
         col_table, col_bars = st.columns([3, 2])
         with col_table:
             render_trade_table(trades)
@@ -1407,10 +1417,12 @@ def main():
                         "SUCCESS": "log-ok", "WARNING": "log-warn",
                         "ERROR": "log-err",
                     }.get(level, "log-info")
+                    etype = html_mod.escape(str(e["type"]))
+                    msg = html_mod.escape(str(e["message"]))
                     line = (
                         f'<span class="log-ts">{ts}</span> '
-                        f'<span class="{level_cls}">{e["type"]}</span> '
-                        f'<span class="log-msg">{e["message"]}</span>'
+                        f'<span class="{level_cls}">{etype}</span> '
+                        f'<span class="log-msg">{msg}</span>'
                     )
                     lines.append(line)
                 st.markdown(

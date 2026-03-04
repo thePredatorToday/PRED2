@@ -90,7 +90,7 @@ async def main():
             mod = modules.get(name)
             if not mod:
                 return None
-            if getattr(mod, "is_running", False) or getattr(mod, "_running", False):
+            if getattr(mod, "is_running", False):
                 asyncio.create_task(mod.stop())
                 logger.info(f"Module stop requested: {name}")
 
@@ -225,7 +225,6 @@ async def main():
                         status = (
                             "running"
                             if getattr(mod, "is_running", False)
-                            or getattr(mod, "_running", False)
                             else "stopped"
                         )
                         db.save_module_report(name, status, json.dumps(metrics))

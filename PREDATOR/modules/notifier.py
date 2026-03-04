@@ -18,21 +18,21 @@ logger = logging.getLogger("Predator.Notifier")
 
 class Notifier:
     def __init__(self):
-        self._running = False
+        self.is_running = False
         self._tasks = set()
 
     async def start(self):
-        if self._running:
+        if self.is_running:
             return
         bus.subscribe("TRADE_SIGNAL_READY", self._on_trade_signal)
         bus.subscribe("RISK_APPROVED_FOR_EXECUTION", self._on_risk_approved)
         bus.subscribe("POSITION_CLOSED", self._on_position_closed)
         bus.subscribe("RISK_VETOED", self._on_veto)
-        self._running = True
+        self.is_running = True
         logger.info("Notifier started and subscribed to events")
 
     async def stop(self):
-        self._running = False
+        self.is_running = False
         for t in list(self._tasks):
             t.cancel()
         logger.info("Notifier stopped")
